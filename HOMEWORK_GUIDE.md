@@ -1,151 +1,296 @@
 # ADC/PWM Homework Implementation Guide
 ## Texas Instruments F280049C LaunchPad
 
-This guide explains how to implement the homework tasks using the C2000Ware SDK for the F280049C microcontroller.
+This guide explains how to implement the homework tasks using register-level programming for the F280049C microcontroller.
+
+---
+
+## System Overview
+
+The implementation uses:
+- **ePWM1** to generate a 100 kHz PWM signal and trigger ADC conversions
+- **EPWM1 SOCA** triggers **ADC SOC3** every PWM cycle
+- **ADCIN3** (channel A3) is sampled with 12-bit resolution
+- **EPWM1_ISR** interrupt reads ADC result and updates PWM duty cycle
+- **EPWM1A** output (GPIO0) reflects the adjusted duty cycle
+
+### Key Specifications
+- **PWM Frequency**: 100 kHz (10 μs period, TBPRD = 999)
+- **ADC Resolution**: 12-bit (0-4095 counts)
+- **ADC Reference**: External 3.3V (configurable to internal)
+- **ADC Input Channel**: ADCIN3 (A3)
+- **ADC Sample Rate**: 100 kHz (triggered by EPWM1 SOCA)
+- **ADC Clock**: 50 MHz (SYSCLK/2)
+- **Sample Window**: 360 ns (ACQPS = 35)
 
 ---
 
 ## Task 1: ADC/PWM Triggering and Measurement
 
 ### Objective
-Use EPWMx SOCx to trigger ADCx SOCx to sample ADCAINx pin. In the ADC interrupt subroutine, record max/min values and compare internal vs external reference voltage.
+Use EPWM1 SOCA to trigger ADC SOC3 to sample ADCIN3 pin. In the EPWM1 interrupt subroutine, record max/min values and compare internal vs external reference voltage.
 
 ### Implementation Steps
 
-#### 1. Configure EPWM to Generate SOC Events
+#### 1. Configure ePWM1 Time Base (`Init_ePWM()`)
 
 ```c
-#include "driverlib.h"
-#include "device.h"
-
-// Configure EPWM1 to generate SOCA event
-void configureEPWM1(void)
+void Init_ePWM(void)
 {
-    // Set time-base period (adjust for desired PWM frequency)
-    EPWM_setTimeBasePeriod(EPWM1_BASE, 1000);  // Example: 1000 counts
-    
-    // Set compare value to trigger SOCA (e.g., at 50% duty cycle)
-    EPWM_setCounterCompareValue(EPWM1_BASE, EPWM_COUNTER_COMPARE_A, 500);
-    
-    // Enable SOCA on counter = CMPA
-    EPWM_enableADCTrigger(EPWM1_BASE, EPWM_SOC_A);
-    EPWM_setADCTriggerEventPrescale(EPWM1_BASE, EPWM_SOC_A, 1);
-    
-    // Set SOCA trigger source (when counter equals CMPA)
-    EPWM_setADCTriggerSource(EPWM1_BASE, EPWM_SOC_A, EPWM_SOC_TBCTR_CMPA);
-    
-    // Set time-base counter mode
-    EPWM_setTimeBaseCounterMode(EPWM1_BASE, EPWM_COUNTER_MODE_UP);
-    
-    // Enable time-base counter
-    EPWM_enableTimeBaseCounter(EPWM1_BASE);
+    EALLOW;
+    // Enable CPU clock to ePWM
+    CpuSysRegs.PCLKCR0.bit.TBCLKSYNC = 1;
+    CpuSysRegs.PCLKCR2.bit.EPWM1 = 1;
+
+    // TBCLK = SYSCLK = 100 MHz -> T_TBCLK = 10 ns
+    EPwm1Regs.TBCTL.bit.HSPCLKDIV = 0;
+    EPwm1Regs.TBCTL.bit.CLKDIV = 0;
+
+    // Free run mode (for debug)
+    EPwm1Regs.TBCTL.bit.FREE_SOFT = 2;
+
+    // Counter mode: Up-count
+    EPwm1Regs.TBCTL.bit.CTRMODE = 0;
+
+    // Clear counter
+    EPwm1Regs.TBCTR = 0;
+
+    // Period setting: PRD = 999 -> (999+1)*10 ns = 10 us -> 100 kHz
+    EPwm1Regs.TBPRD = 999;
+
+    // Use Shadow mode to update TBPRD
+    EPwm1Regs.TBCTL.bit.PRDLD = 0;
+    EPwm1Regs.TBCTL2.bit.PRDLDSYNC = 0;  // Load when TBCTR = 0
+    EDIS;
 }
 ```
 
-#### 2. Configure ADC with EPWM SOC Trigger
+#### 2. Configure ePWM1 Compare Registers (`Init_ePWM_CC()`)
 
 ```c
-void configureADC(void)
+void Init_ePWM_CC(void)
 {
-    // Enable ADC module
-    ADC_enableModule(ADCA_BASE);
-    
-    // Set reference voltage (INTERNAL for Task 1a, EXTERNAL for Task 1b)
-    // For internal reference:
-    ADC_setVREF(ADCA_BASE, ADC_REFERENCE_INTERNAL, ADC_REFERENCE_3_3V);
-    ADC_setOffsetTrimAll(ADC_REFERENCE_INTERNAL, ADC_REFERENCE_3_3V);
-    
-    // For external reference (uncomment when testing Task 1b):
-    // ADC_setVREF(ADCA_BASE, ADC_REFERENCE_EXTERNAL, ADC_REFERENCE_3_3V);
-    // ADC_setOffsetTrimAll(ADC_REFERENCE_EXTERNAL, ADC_REFERENCE_3_3V);
-    
-    // Setup SOC0 to trigger from EPWM1 SOCA
-    ADC_setupSOC(ADCA_BASE, 
-                 ADC_SOC_NUMBER0,              // SOC number
-                 ADC_TRIGGER_EPWM1_SOCA,      // Trigger from EPWM1 SOCA
-                 ADC_CH_ADCIN0,               // Channel (adjust to your pin: ADCAINx)
-                 10);                          // Sample window (SYSCLK cycles)
-    
-    // Enable ADC interrupt for SOC0
-    ADC_setInterruptSource(ADCA_BASE, ADC_INT_NUMBER1, ADC_SOC_NUMBER0);
-    ADC_enableInterrupt(ADCA_BASE, ADC_INT_NUMBER1);
-    ADC_setInterruptPulseMode(ADCA_BASE, ADC_PULSE_END_OF_CONV);
+    EALLOW;
+    // Set CMPA to half period -> 50% duty cycle initially
+    EPwm1Regs.CMPA.bit.CMPA = 0.5 * (EPwm1Regs.TBPRD);
+
+    // CMPB same as CMPA
+    EPwm1Regs.CMPB.bit.CMPB = EPwm1Regs.CMPA.bit.CMPA;
+
+    // Use shadow mode for updates
+    EPwm1Regs.CMPCTL.bit.SHDWAMODE = CC_SHADOW;
+    EPwm1Regs.CMPCTL.bit.SHDWBMODE = CC_SHADOW;
+
+    // Shadow load condition: Load when TBCTR = 0
+    EPwm1Regs.CMPCTL.bit.LOADASYNC = 0;
+    EPwm1Regs.CMPCTL.bit.LOADBSYNC = 0;
+    EPwm1Regs.CMPCTL.bit.LOADAMODE = 0;
+    EPwm1Regs.CMPCTL.bit.LOADBMODE = 0;
+    EDIS;
 }
 ```
 
-#### 3. Global Variables for Max/Min Tracking
+#### 3. Configure ePWM1 Action Qualifier (`Init_ePWM_AQ()`)
+
+```c
+void Init_ePWM_AQ(void)
+{
+    EALLOW;
+    // ZRO -> set EPWM1A high
+    EPwm1Regs.AQCTLA.bit.ZRO = 2;  // set EPWM1A high
+    // CAU -> clear EPWM1A low
+    EPwm1Regs.AQCTLA.bit.CAU = 1;  // clear EPWM1A low
+    EPwm1Regs.AQCTLA.bit.CBU = 0;
+    EPwm1Regs.AQCTLA.bit.PRD = 0;
+
+    // Software force reload condition
+    EPwm1Regs.AQSFRC.bit.RLDCSF = 0;
+
+    // No software force output
+    EPwm1Regs.AQCSFRC.bit.CSFA = 0;
+    EPwm1Regs.AQCSFRC.bit.CSFB = 0;
+    EDIS;
+}
+```
+
+#### 4. Configure ePWM1 Event Trigger and Dead-Band (`Init_ePWM_DB_ET()`)
+
+```c
+void Init_ePWM_DB_ET(void)
+{
+    EALLOW;
+    // ------ DB submodule ------
+    // No dead-band
+    EPwm1Regs.DBCTL.bit.OUT_MODE = 0;
+
+    // ------ ET submodule ------
+    // Interrupt event condition: INTSEL = 1 -> Trigger when TBCTR = 0
+    EPwm1Regs.ETSEL.bit.INTSEL = 1;
+    // Enable EPWM1 interrupt
+    EPwm1Regs.ETSEL.bit.INTEN = 1;
+    // Clear interrupt flag once
+    EPwm1Regs.ETCLR.bit.INT = 1;
+    // Trigger once per event -> 10 us once -> 100 kHz
+    EPwm1Regs.ETPS.bit.INTPSEL = 0;
+    EPwm1Regs.ETPS.bit.INTPRD = 1;
+
+    // SOCA event condition: TBCTR = 0
+    EPwm1Regs.ETSEL.bit.SOCASEL = 1;
+    // Enable EPWM1 SOCA
+    EPwm1Regs.ETSEL.bit.SOCAEN = 1;
+    // One SOCA per event -> 10 us once
+    EPwm1Regs.ETPS.bit.SOCPSSEL = 0;
+    EPwm1Regs.ETPS.bit.SOCAPRD = 1;
+    EDIS;
+}
+```
+
+#### 5. Configure ADC Module (`Init_ADC()`)
+
+```c
+void Init_ADC(void)
+{
+    // Set ADCA to use external 3.3V reference
+    // For internal reference, change to:
+    // SetVREF(ADC_ADCA, ADC_INTERNAL, ADC_VREF3P3);
+    SetVREF(ADC_ADCA, ADC_EXTERNAL, ADC_VREF3P3);
+
+    EALLOW;
+    // Enable ADCA clock
+    CpuSysRegs.PCLKCR13.bit.ADC_A = 1;
+
+    // ADCCLK = SYSCLK / 2 = 50 MHz
+    AdcaRegs.ADCCTL2.bit.PRESCALE = 2;
+
+    // Generate EOC pulse when conversion completes (for interrupt)
+    AdcaRegs.ADCCTL1.bit.INTPULSEPOS = 1;
+
+    // Enable ADCA module
+    AdcaRegs.ADCCTL1.bit.ADCPWDNZ = 1;
+
+    // ADC needs time to wake up
+    DELAY_US(1000);
+    EDIS;
+}
+```
+
+#### 6. Configure ADC Start-of-Conversion (`Init_ADCSOC()`)
+
+```c
+void Init_ADCSOC(void)
+{
+    EALLOW;
+    // Set SOC0~SOC15 to high priority
+    AdcaRegs.ADCSOCPRICTL.bit.SOCPRIORITY = 0x10;
+
+    // Use ADCA SOC3
+    // Trigger source: 5 -> EPWM1 SOCA
+    AdcaRegs.ADCSOC3CTL.bit.TRIGSEL = 5;
+    // Sample source: ADCIN3 (A3)
+    AdcaRegs.ADCSOC3CTL.bit.CHSEL = 3;
+    // Sample time: ACQPS = 35 -> (35+1)*10 ns = 360 ns
+    AdcaRegs.ADCSOC3CTL.bit.ACQPS = 35;
+
+    // Disable ADCAINT1 interrupt, use ePWM interrupt instead
+    AdcaRegs.ADCINTSEL1N2.bit.INT1E = 0;
+    EDIS;
+}
+```
+
+#### 7. Configure PIE Interrupt Controller (`Init_PIE()`)
+
+```c
+void Init_PIE(void)
+{
+    DINT;  // Disable CPU global interrupt
+
+    // Enable PIE
+    PieCtrlRegs.PIECTRL.bit.ENPIE = 1;
+
+    // Set PIE control to default
+    InitPieCtrl();
+
+    // Clear CPU interrupt flags
+    IER = 0x0000;
+    IFR = 0x0000;
+
+    // Build PIE vector table
+    InitPieVectTable();
+
+    // Enable PIE group 3, INTx1 (EPWM1 interrupt)
+    PieCtrlRegs.PIEIER3.bit.INTx1 = 1;
+
+    // Enable CPU INT3
+    IER |= M_INT3;
+
+    EINT;  // Enable CPU global interrupt
+    ERTM;  // Enable real-time interrupt
+}
+```
+
+#### 8. Global Variables for Max/Min Tracking
+
+Add these global variables to track min/max values:
 
 ```c
 // Global variables for Task 1
 uint16_t adcResultMin = 0xFFFF;  // Start with maximum value
 uint16_t adcResultMax = 0x0000;  // Start with minimum value
-uint16_t currentAdcResult = 0;
 ```
 
-#### 4. ADC Interrupt Service Routine
+#### 9. EPWM1 Interrupt Service Routine
 
 ```c
-__interrupt void adca1_isr(void)
+interrupt void EPWM1_ISR(void)
 {
-    // Read ADC result
-    currentAdcResult = ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER0);
-    
-    // Track minimum value
-    if (currentAdcResult < adcResultMin)
+    unsigned long long c = 0;  // Declare to avoid multiplication overflow
+
+    EALLOW;
+    // Read ADCA result (SOC3 -> ADCRESULT3)
+    c = AdcaResultRegs.ADCRESULT3;
+
+    // Track minimum value (for Task 1)
+    if (c < adcResultMin)
     {
-        adcResultMin = currentAdcResult;
+        adcResultMin = (uint16_t)c;
     }
-    
-    // Track maximum value
-    if (currentAdcResult > adcResultMax)
+
+    // Track maximum value (for Task 1)
+    if (c > adcResultMax)
     {
-        adcResultMax = currentAdcResult;
+        adcResultMax = (uint16_t)c;
     }
-    
-    // Clear interrupt flag
-    ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER1);
-    
-    // Acknowledge interrupt
-    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
+
+    // Adjust PWM duty based on ADC value (for Task 3)
+    // ADC is 12-bit -> divide by 2^12 (=4096) -> use shift >> 12
+    EPwm1Regs.CMPA.bit.CMPA = (c * EPwm1Regs.TBPRD) >> 12;
+
+    // Clear ePWM1 interrupt flag
+    EPwm1Regs.ETCLR.bit.INT = 1;
+    // Clear PIE group3 ACK
+    PieCtrlRegs.PIEACK.all = PIEACK_GROUP3;
+    EDIS;
 }
 ```
 
-#### 5. Register Interrupt Handler
+#### 10. Register Interrupt Handler in main()
+
+The interrupt handler must be registered in the PIE vector table. Add this to your main function or initialization:
 
 ```c
-void main(void)
-{
-    Device_init();
-    Device_initGPIO();
-    Interrupt_initModule();
-    Interrupt_initVectorTable();
-    
-    // Register ADC interrupt
-    Interrupt_register(INT_ADCA1, &adca1_isr);
-    Interrupt_enable(INT_ADCA1);
-    
-    // Configure EPWM and ADC
-    configureEPWM1();
-    configureADC();
-    
-    // Enable global interrupts
-    EINT;
-    ERTM;
-    
-    // Start EPWM
-    EPWM_startTimeBaseCounter(EPWM1_BASE);
-    
-    while(1)
-    {
-        // Main loop - max/min values are updated in interrupt
-        // You can add code here to display or log results
-    }
-}
+// Register EPWM1 interrupt handler
+EALLOW;
+PieVectTable.EPWM1_INT = &EPWM1_ISR;
+EDIS;
 ```
 
-### Comparison Notes
-- **Internal Reference**: Typically 2.5V or 3.3V, factory calibrated
+### Comparison Notes for Task 1
+- **Internal Reference**: Factory calibrated, typically 3.3V
 - **External Reference**: Uses VREFHI pin, more stable but requires external source
+- To test internal reference, change `Init_ADC()`:
+  ```c
+  SetVREF(ADC_ADCA, ADC_INTERNAL, ADC_VREF3P3);
+  ```
 - Compare `adcResultMax` and `adcResultMin` values between the two configurations
 - External reference usually provides better accuracy and stability
 
@@ -156,303 +301,288 @@ void main(void)
 ### Objective
 Use the low-pass filter circuit space on the development board to observe the impact of a filter capacitor on ADC conversion.
 
-### Implementation
+### Hardware Setup
 
-#### Hardware Setup
-1. Locate the DNP (Do Not Populate) capacitor footprints on the board (C26-C31, 330pF each)
-2. Connect a capacitor between GND and the ADC input pin through the 0-ohm resistor (R14, R16, R17, etc.)
-3. Apply a signal source with varying frequency to ADCINx
+1. **Locate DNP Capacitor Footprints**: 
+   - On the F280049C LaunchPad, find capacitor footprints C26-C31 (330pF each)
+   - These are marked as "DNP" (Do Not Populate) on the board
 
-#### Code Changes
-```c
-// Use the same ADC configuration as Task 1
-// The filter will automatically affect the signal
+2. **Install Filter Capacitor**:
+   - For ADCIN3, locate the corresponding capacitor footprint (check schematic)
+   - Install a 330pF capacitor between the ADC input pin and GND
+   - The capacitor connects through a 0-ohm resistor (R14, R16, R17, R18, R20, or R21)
 
-// For testing, you can:
-// 1. Apply a square wave with fast edges
-// 2. Measure ADC results with and without capacitor
-// 3. Observe how capacitor smooths out high-frequency noise
+3. **Signal Source**:
+   - Apply a signal source with varying frequency to ADCIN3
+   - Use a function generator or potentiometer with noise
 
-// Example: Compare results
-uint16_t adcResultWithFilter = 0;
-uint16_t adcResultWithoutFilter = 0;
+### Code Changes
 
-// In your ISR or main loop, compare results
-// The capacitor will reduce high-frequency noise and ripple
-```
+**No code changes required!** The filter affects the hardware signal, so the same code works for both cases.
+
+### Testing Procedure
+
+1. **Without Filter**:
+   - Measure ADC results with oscilloscope
+   - Apply a square wave with fast edges
+   - Observe ADC results may show noise/ripple
+
+2. **With Filter**:
+   - Install 330pF capacitor
+   - Apply the same signal
+   - Observe ADC results should be smoother
+   - Response may be slower to fast changes
 
 ### Observations
+
 - **Without filter**: ADC may show noise/ripple from high-frequency components
 - **With filter**: ADC results should be smoother, but may have slower response to fast changes
 - **330pF capacitor**: Creates a low-pass filter with RC time constant based on source impedance
+- **Cutoff frequency**: Depends on source impedance and capacitor value
+- **Trade-off**: Better noise rejection vs. slower response time
 
 ---
 
 ## Task 3: PWM Duty Cycle Control from ADC
 
 ### Objective
-Use ADCRESULTx to adjust EPWM duty cycle. When input is 0V → duty cycle = 0%, when input is 3.3V → duty cycle = 100%.
+Use ADCRESULT3 to adjust EPWM1 duty cycle. When input is 0V → duty cycle = 0%, when input is 3.3V → duty cycle = 100%.
 
 ### Implementation
 
-#### 1. Modify ADC Interrupt to Update PWM Duty Cycle
+The implementation is already included in the `EPWM1_ISR()` function shown in Task 1. The key calculation is:
 
 ```c
-// Global variable for EPWM period (set during initialization)
-uint16_t epwmPeriod = 1000;  // Example: 1000 counts
-
-__interrupt void adca1_isr(void)
-{
-    uint16_t adcResult;
-    uint16_t epwmCompareValue;
-    
-    // Read ADC result (12-bit: 0-4095 for 3.3V reference)
-    adcResult = ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER0);
-    
-    // Linear mapping: 0V (ADC=0) → 0% duty, 3.3V (ADC=4095) → 100% duty
-    // Duty cycle = (ADC_result / 4095) * 100%
-    // Compare value = (ADC_result * period) / 4095
-    epwmCompareValue = (adcResult * epwmPeriod) / 4095;
-    
-    // Update EPWM compare value (use shadow register for glitch-free update)
-    EPWM_setCounterCompareValue(EPWM1_BASE, 
-                                EPWM_COUNTER_COMPARE_A, 
-                                epwmCompareValue);
-    
-    // Optional: Also track min/max for Task 1
-    if (adcResult < adcResultMin) adcResultMin = adcResult;
-    if (adcResult > adcResultMax) adcResultMax = adcResult;
-    
-    // Clear interrupt
-    ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER1);
-    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
-}
+// Linear mapping: 0V (ADC=0) -> 0% duty, 3.3V (ADC=4095) -> 100% duty
+// Duty cycle = (ADC_result / 4095) * 100%
+// Compare value = (ADC_result * TBPRD) / 4095
+EPwm1Regs.CMPA.bit.CMPA = (c * EPwm1Regs.TBPRD) >> 12;
 ```
 
-#### 2. Configure EPWM with Shadow Register
+### Duty Cycle Calculation
 
-```c
-void configureEPWM1(void)
-{
-    // Set time-base period
-    epwmPeriod = 1000;
-    EPWM_setTimeBasePeriod(EPWM1_BASE, epwmPeriod);
-    
-    // Set compare value to 0 initially (0% duty cycle)
-    EPWM_setCounterCompareValue(EPWM1_BASE, EPWM_COUNTER_COMPARE_A, 0);
-    
-    // Configure shadow register load mode (load on period)
-    EPWM_setCounterCompareShadowLoadMode(EPWM1_BASE, 
-                                         EPWM_COUNTER_COMPARE_A, 
-                                         EPWM_SHADOW_LOAD_MODE_PERIOD);
-    
-    // Enable SOCA trigger
-    EPWM_enableADCTrigger(EPWM1_BASE, EPWM_SOC_A);
-    EPWM_setADCTriggerSource(EPWM1_BASE, EPWM_SOC_A, EPWM_SOC_TBCTR_CMPA);
-    
-    // Configure output pins (if needed)
-    // EPWM_setActionQualifierAction(...);
-    
-    // Set counter mode
-    EPWM_setTimeBaseCounterMode(EPWM1_BASE, EPWM_COUNTER_MODE_UP);
-    
-    // Enable counter
-    EPWM_enableTimeBaseCounter(EPWM1_BASE);
-}
+The PWM duty cycle is linearly proportional to the ADC input voltage:
+
+```
+Duty Cycle = (ADC_value / 4095) × 100%
+CMPA = (ADC_value × TBPRD) >> 12
 ```
 
-#### 3. Verification
-- **Input 0V**: ADC ≈ 0 → Compare value = 0 → Duty cycle = 0%
-- **Input 1.65V**: ADC ≈ 2048 → Compare value ≈ 500 → Duty cycle ≈ 50%
-- **Input 3.3V**: ADC ≈ 4095 → Compare value = period → Duty cycle = 100%
+**Mapping:**
+- **0V input** (ADC = 0) → **0% duty cycle** (CMPA = 0)
+- **1.65V input** (ADC = 2048) → **50% duty cycle** (CMPA = 500)
+- **3.3V input** (ADC = 4095) → **100% duty cycle** (CMPA = 999)
+
+### Verification Steps
+
+1. **Input 0V**: 
+   - ADC ≈ 0 → CMPA = 0 → Duty cycle = 0%
+   - Verify with oscilloscope on GPIO0 (EPWM1A)
+
+2. **Input 1.65V**: 
+   - ADC ≈ 2048 → CMPA ≈ 500 → Duty cycle ≈ 50%
+   - Verify with oscilloscope
+
+3. **Input 3.3V**: 
+   - ADC ≈ 4095 → CMPA = 999 → Duty cycle = 100%
+   - Verify with oscilloscope
+
+### Important Notes
+
+- **Shadow Registers**: CMPA uses shadow mode, so updates occur at TBCTR = 0 (glitch-free)
+- **Update Rate**: Duty cycle updates every 10 μs (100 kHz)
+- **Resolution**: 12-bit ADC provides 4096 steps for duty cycle control
+- **Linear Mapping**: The relationship is perfectly linear across the full range
 
 ---
 
-## Task 4: Temperature Sensor (Optional)
+## Complete Implementation Structure
 
-### Objective
-Use EPWMx SOCx to trigger a TempSensor conversion.
-
-### Implementation
-
-```c
-void configureTemperatureSensor(void)
-{
-    // Setup SOC for temperature sensor channel
-    // Temperature sensor is typically on a dedicated ADC channel
-    // Check device datasheet for exact channel number
-    
-    // Example: If temperature sensor is on ADC channel 15
-    ADC_setupSOC(ADCA_BASE,
-                 ADC_SOC_NUMBER1,              // Use different SOC number
-                 ADC_TRIGGER_EPWM1_SOCA,      // Same EPWM trigger
-                 ADC_CH_ADCIN15,              // Temperature sensor channel
-                 10);                         // Sample window
-    
-    // Enable interrupt for temperature sensor SOC
-    ADC_setInterruptSource(ADCA_BASE, ADC_INT_NUMBER2, ADC_SOC_NUMBER1);
-    ADC_enableInterrupt(ADCA_BASE, ADC_INT_NUMBER2);
-}
-
-__interrupt void adca2_isr(void)
-{
-    uint16_t tempResult;
-    int16_t tempCelsius;
-    
-    // Read temperature sensor result
-    tempResult = ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER1);
-    
-    // Convert to temperature (using internal reference)
-    tempCelsius = ADC_getTemperatureC(tempResult, 
-                                      ADC_REFERENCE_INTERNAL, 
-                                      2.5f);  // Reference voltage
-    
-    // Process temperature reading...
-    
-    // Clear interrupt
-    ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER2);
-    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
-}
-```
-
-### Temperature Conversion Function
-```c
-// ADC_getTemperatureC() is available in C2000Ware
-// Parameters:
-// - tempResult: Raw ADC reading from temperature sensor
-// - refMode: ADC_REFERENCE_INTERNAL or ADC_REFERENCE_EXTERNAL
-// - vref: Reference voltage used (typically 2.5V or 3.3V)
-```
-
----
-
-## Complete Example Structure
+### File: `main.c`
 
 ```c
 #include "driverlib.h"
 #include "device.h"
 
-// Global variables
-uint16_t adcResultMin = 0xFFFF;
-uint16_t adcResultMax = 0x0000;
-uint16_t epwmPeriod = 1000;
+// External function declarations (from int.c)
+extern void Init_PIE(void);
+extern void Init_ePWM(void);
+extern void Init_ePWM_CC(void);
+extern void Init_ePWM_AQ(void);
+extern void Init_ePWM_DB_ET(void);
+extern void Init_ADC(void);
+extern void Init_ADCSOC(void);
 
-// Function prototypes
-void configureEPWM1(void);
-void configureADC(void);
-void configureADCInterrupt(void);
-
-// Interrupt handlers
-__interrupt void adca1_isr(void);
+// External interrupt handler (from int.c)
+extern interrupt void EPWM1_ISR(void);
 
 void main(void)
 {
-    // Initialize device
-    Device_init();
-    Device_initGPIO();
-    Interrupt_initModule();
-    Interrupt_initVectorTable();
-    
-    // Configure peripherals
-    configureEPWM1();
-    configureADC();
-    configureADCInterrupt();
-    
-    // Register interrupt
-    Interrupt_register(INT_ADCA1, &adca1_isr);
-    Interrupt_enable(INT_ADCA1);
-    
-    // Enable interrupts
-    EINT;
-    ERTM;
-    
-    // Start EPWM
-    EPWM_startTimeBaseCounter(EPWM1_BASE);
-    
-    // Main loop
+    InitSysCtrl();   // System clock
+    Init_GPIO();     // GPIO initialization (must be provided)
+    Init_PIE();
+    Init_ePWM();
+    Init_ePWM_CC();
+    Init_ePWM_AQ();
+    Init_ePWM_DB_ET();
+    Init_ADC();
+    Init_ADCSOC();
+
+    // Register EPWM1 interrupt handler
+    EALLOW;
+    PieVectTable.EPWM1_INT = &EPWM1_ISR;
+    EDIS;
+
+    // Configure GPIO0 as EPWM1A output
+    EALLOW;
+    GpioCtrlRegs.GPADIR.bit.GPIO0 = 1;
+    GpioCtrlRegs.GPAGMUX1.bit.GPIO0 = 0;
+    GpioCtrlRegs.GPAMUX1.bit.GPIO0 = 1;   // 1 -> EPWM1A
+    GpioCtrlRegs.GPACSEL1.bit.GPIO0 = 0;
+    GpioCtrlRegs.GPAPUD.bit.GPIO0 = 0;
+    EDIS;
+
     while(1)
     {
-        // Add your code here
+        // Main loop - all processing in interrupt
     }
-}
-
-void configureEPWM1(void)
-{
-    // EPWM configuration as shown above
-}
-
-void configureADC(void)
-{
-    // ADC configuration as shown above
-}
-
-void configureADCInterrupt(void)
-{
-    // Interrupt configuration
-}
-
-__interrupt void adca1_isr(void)
-{
-    // ISR implementation for Task 1 and Task 3
 }
 ```
 
+### File: `int.c`
+
+Contains all the initialization functions and interrupt service routine as shown in the task sections above.
+
 ---
 
-## Key C2000Ware Functions Reference
+## Configuration Options
 
-### ADC Functions
-- `ADC_setupSOC()` - Configure Start-of-Conversion
-- `ADC_setVREF()` - Set reference voltage (internal/external)
-- `ADC_readResult()` - Read conversion result
-- `ADC_setInterruptSource()` - Configure ADC interrupt
-- `ADC_clearInterruptStatus()` - Clear interrupt flag
-- `ADC_getTemperatureC()` - Convert temperature sensor reading
+### Changing ADC Input Channel
 
-### EPWM Functions
-- `EPWM_setTimeBasePeriod()` - Set PWM period
-- `EPWM_setCounterCompareValue()` - Set duty cycle (compare value)
-- `EPWM_enableADCTrigger()` - Enable SOC trigger
-- `EPWM_setADCTriggerSource()` - Set SOC trigger source
-- `EPWM_setCounterCompareShadowLoadMode()` - Configure shadow register
+To use a different ADC channel, modify `Init_ADCSOC()`:
 
-### Trigger Constants
-- `ADC_TRIGGER_EPWM1_SOCA` - EPWM1 SOCA trigger
-- `ADC_TRIGGER_EPWM1_SOCB` - EPWM1 SOCB trigger
-- `ADC_TRIGGER_EPWMx_SOCA/SOCB` - For other EPWM modules
+```c
+// Change CHSEL to your desired channel (0-15)
+AdcaRegs.ADCSOC3CTL.bit.CHSEL = 3;  // Change 3 to your channel number
+```
+
+### Changing PWM Frequency
+
+To change PWM frequency, modify `Init_ePWM()`:
+
+```c
+// For 10 kHz: TBPRD = 9999 (10,000 counts × 10ns = 100μs)
+EPwm1Regs.TBPRD = 9999;
+
+// For 1 kHz: TBPRD = 99999 (100,000 counts × 10ns = 1ms)
+EPwm1Regs.TBPRD = 99999;
+```
+
+**Formula:** `TBPRD = (SYSCLK / desired_frequency) - 1`
+
+### Changing ADC Sample Window
+
+To adjust ADC acquisition time, modify `Init_ADCSOC()`:
+
+```c
+// ACQPS = (desired_time_ns / 10ns) - 1
+// For 500ns: ACQPS = 49
+AdcaRegs.ADCSOC3CTL.bit.ACQPS = 35;  // Current: 360ns
+```
+
+### Changing Reference Voltage
+
+To switch between internal and external reference, modify `Init_ADC()`:
+
+```c
+// For internal reference:
+SetVREF(ADC_ADCA, ADC_INTERNAL, ADC_VREF3P3);
+
+// For external reference:
+SetVREF(ADC_ADCA, ADC_EXTERNAL, ADC_VREF3P3);
+```
 
 ---
 
 ## Testing Checklist
 
-- [ ] Task 1: EPWM triggers ADC, max/min values recorded
+- [ ] Task 1: EPWM1 triggers ADC SOC3, max/min values recorded
 - [ ] Task 1: Internal reference tested
 - [ ] Task 1: External reference tested
-- [ ] Task 1: Results compared
-- [ ] Task 2: Filter capacitor installed
-- [ ] Task 2: Impact of filter observed
+- [ ] Task 1: Results compared between reference modes
+- [ ] Task 2: Filter capacitor installed (330pF)
+- [ ] Task 2: Impact of filter observed (with/without capacitor)
 - [ ] Task 3: Duty cycle scales from 0% to 100% with ADC input
 - [ ] Task 3: Linear mapping verified (0V→0%, 3.3V→100%)
-- [ ] Task 4: Temperature sensor conversion triggered (optional)
+- [ ] Task 3: PWM output verified on GPIO0 with oscilloscope
 
 ---
 
-## Notes
+## Important Notes
 
-1. **Pin Configuration**: Check your board schematic for exact ADC input pins (ADCAINx)
-2. **Reference Voltage**: Ensure external reference is properly connected if using external mode
-3. **Interrupt Priority**: Configure interrupt priorities if using multiple interrupts
-4. **Shadow Registers**: Use shadow registers for glitch-free PWM updates
-5. **ADC Resolution**: F280049C has 12-bit ADC (0-4095 counts)
+1. **Pin Configuration**: 
+   - ADC input: **ADCIN3** (check board schematic for exact pin number)
+   - PWM output: **GPIO0** configured as **EPWM1A**
+
+2. **Reference Voltage**: 
+   - Ensure external reference is properly connected if using external mode
+   - Internal reference is factory calibrated
+
+3. **Interrupt Timing**: 
+   - ISR executes every 10 μs, so keep ISR code short
+   - All processing must complete before next interrupt
+
+4. **Shadow Registers**: 
+   - CMPA uses shadow mode for glitch-free PWM updates
+   - Shadow registers load when TBCTR = 0
+
+5. **ADC Resolution**: 
+   - F280049C has 12-bit ADC (0-4095 counts)
+   - Full scale corresponds to reference voltage (3.3V)
+
+6. **Register Access**: 
+   - Always use `EALLOW`/`EDIS` when modifying protected registers
+   - Interrupt acknowledgment: Must clear both ePWM and PIE interrupt flags
+
+---
+
+## Troubleshooting
+
+1. **No PWM Output**:
+   - Verify GPIO0 is configured correctly
+   - Check ePWM clock is enabled (`CpuSysRegs.PCLKCR2.bit.EPWM1`)
+   - Verify time base is running (check `EPwm1Regs.TBCTR` in debugger)
+
+2. **ADC Not Converting**:
+   - Verify EPWM1 is generating SOCA events
+   - Check ADC clock is enabled (`CpuSysRegs.PCLKCR13.bit.ADC_A`)
+   - Verify SOC3 configuration matches trigger source (TRIGSEL = 5)
+
+3. **Duty Cycle Not Updating**:
+   - Check interrupt is firing (set breakpoint in `EPWM1_ISR()`)
+   - Verify shadow mode is configured correctly
+   - Check ADC result register is updating (`AdcaResultRegs.ADCRESULT3`)
+
+4. **Wrong ADC Values**:
+   - Verify reference voltage configuration
+   - Check input voltage is within 0-3.3V range
+   - Verify correct ADC channel is selected (CHSEL = 3)
+
+5. **Interrupt Not Firing**:
+   - Verify PIE is enabled and configured
+   - Check interrupt handler is registered in vector table
+   - Verify interrupt flags are being cleared properly
 
 ---
 
 ## Additional Resources
 
-- C2000Ware SDK: `device_support/f28004x/`
-- ADC Examples: `device_support/f28004x/examples/adc/`
-- EPWM Examples: `device_support/f28004x/examples/epwm/`
-- Device Datasheet: F280049C Technical Reference Manual
+- **C2000Ware SDK**: `device_support/f28004x/`
+- **ADC Examples**: `device_support/f28004x/examples/adc/`
+- **EPWM Examples**: `device_support/f28004x/examples/epwm/`
+- **Device Datasheet**: F280049C Technical Reference Manual (SPRUHX5)
+- **Register Reference**: F28004x Peripheral Reference Guide
+
+---
 
 Good luck with your homework!
-
